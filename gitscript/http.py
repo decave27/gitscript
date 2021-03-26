@@ -7,9 +7,10 @@ import aiohttp
 import sys
 from urllib.parse import quote as _uriquote
 
-from . import UserAuth
+from .httpmodel import UserAuth, TokenAuth
+from .errors import *
 
-__logs__ = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 async def Content_Type(response):
@@ -20,16 +21,6 @@ async def Content_Type(response):
     except KeyError:
         pass
     return text
-
-
-def requires_2fa(response):
-    if (
-        response.status == 401
-        and "X-GitHub-OTP" in response.headers
-        and "required" in response.headers["X-GitHub-OTP"]
-    ):
-        return True
-    return False
 
 
 class Route:
@@ -56,19 +47,18 @@ class Route:
 class HTTPClient:
 
     auth = None
-    SUCCESS_LOG = "{method} {url} has received {text}"
-    REQUEST_LOG = "{method} {url} with {json} has returned {status}"
 
     def __init__(
         self,
         connector=None,
         default_connect_timeout=4,
         default_read_timeout=10,
-        **kwargs
+        **kwargs,
     ):
         self.default_connect_timeout = default_connect_timeout
         self.default_read_timeout = default_read_timeout
         self.connector = connector
+        self._session = aiohttp.ClientSession(connector=self.connector)
         self.two_factor_auth_cb = None
         user_agent = "Gitscript (https://github.com/decave27/gitscript {0}) Python/{1[0]}.{1[1]} aiohttp/{2}"
         self.user_agent = user_agent.format(
@@ -87,14 +77,32 @@ class HTTPClient:
     def timeout(self):
         return (self.default_connect_timeout, self.default_read_timeout)
 
-    def handle_two_factor_auth(self):
-        self.data["headers"]["X-GitHub-OTP"] = str(self.two_factor_auth_cb())
-        return
-
-    def basic_auth(self, username, password):
-        if not (username and password):
+    def token_auth(self, token):
+        if not token:
             return
-        self.auth = UserAuth(username, password)
+        self.auth = TokenAuth(token)
 
     def has_auth(self):
         return self.auth or self.data["headers"]
+
+    async def requests(self, method, endpoint: Route, **kwargs):
+        async with self._session as session:
+            async with session.requests(method, endpoint.url, **kwargs) as response:
+                log.debug(
+                    f'{method} {url} with {kwargs.get("data")} has returned {response.status}'
+                )
+
+                data = await Content_Type(response)
+
+                if 200 <= response.status < 300:
+                    return data
+
+                if response.status == 401:
+                    raise Unauthorized(response, data)
+                elif response.status == 403:
+                    raise Forbidden(response, data)
+                elif response.status == 404:
+                    raise NotFound(response, data)
+                else:
+                    raise HTTPException(response, data)
+        raise HTTPException(response, data)
